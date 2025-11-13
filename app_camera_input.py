@@ -1,41 +1,35 @@
-# app_camera_input.py
 import streamlit as st
 import torch
 import torchvision.transforms as transforms
 from torch import nn
 import timm
 import gdown
-import os
-import io
-from PIL import Image
+import cv2
 import numpy as np
-import time
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
+import av
 import base64
-import tempfile
+import os
 
-st.set_page_config(page_title="Violence Detection (Browser Camera)", layout="wide")
+st.set_page_config(page_title="Violence Detection Live", layout="wide")
 
-st.markdown("""
-# 🎥 Violence Detection (Browser Camera)
-شغّل الكاميرا من المتصفح (موبايل/لابتوب)، التطبّيقات تستخدم ViT + LSTM لتحليل 8 فريمات متتابعة.
-عند اكتشاف سلوك عنيف سيظهر تنبيه بصري ومحاولة تشغيل صوت الإنذار (قد يتطلب سماح التبويب لتشغيل الصوت).
-""")
-
-# ---------- تعديل الرابط هنا إلى رابط Google Drive 'uc?id=...' ----------
+# ---------------------------------------------------------
+# إعدادات تحميل الموديل من Google Drive
+# ---------------------------------------------------------
 MODEL_PATH = "best_vit_lstm.pt"
-MODEL_DRIVE_ID = "1GjmrQSLRtCwAtkk30ZOtFFXFqhOg6BxX"   # ضع id من رابطك
+MODEL_DRIVE_ID = "1GjmrQSLRtCwAtkk30ZOtFFXFqhOg6BxX"
 MODEL_URL = f"https://drive.google.com/uc?id={MODEL_DRIVE_ID}"
-ALERT_AUDIO = "alert.wav"   # ضع alert.wav في نفس المجلد بالمشروع أو في repo
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Download model if missing
 if not os.path.exists(MODEL_PATH):
     with st.spinner("Downloading model from Google Drive..."):
         gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
-        st.success("Model downloaded.")
+        st.success("✅ Model downloaded successfully")
 
-# ----------------- نموذج (مطابق للي عندك) -----------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ---------------------------------------------------------
+# تعريف الموديل
+# ---------------------------------------------------------
 class ViT_LSTM_Classifier(nn.Module):
     def __init__(self, vit_name="vit_tiny_patch16_224", lstm_hidden=256, lstm_layers=1, num_classes=2, dropout=0.3):
         super().__init__()
@@ -59,81 +53,95 @@ class ViT_LSTM_Classifier(nn.Module):
         logits = self.classifier(last)
         return logits
 
-# load model
+# تحميل الموديل
 model = ViT_LSTM_Classifier().to(device)
 state_dict = torch.load(MODEL_PATH, map_location=device)
 model.load_state_dict(state_dict, strict=False)
 model.eval()
 
-# preprocessing
+# ---------------------------------------------------------
+# إعداد التحويل المسبق للفريمات
+# ---------------------------------------------------------
 transform = transforms.Compose([
     transforms.ToPILImage(),
-    transforms.Resize((224,224)),
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5])
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
-st.sidebar.header("Control")
-seq_len = st.sidebar.slider("Sequence length (frames)", min_value=4, max_value=16, value=8, step=1)
-start = st.sidebar.button("Start stream (use camera button below)")
+# ---------------------------------------------------------
+# كود تشغيل الإنذار (صوت)
+# ---------------------------------------------------------
+AUDIO_FILE = "alert.wav"
+alarm_base64 = ""
+if os.path.exists(AUDIO_FILE):
+    with open(AUDIO_FILE, "rb") as f:
+        alarm_base64 = base64.b64encode(f.read()).decode()
 
-st.info("اضغط زر الكاميرا أدناه لفتح الكاميرا في المتصفح ثم التقط صورًا متتابعة (أو ادي للكاميرا تحديث متكرر).")
+audio_html = f"""
+<audio id="alarm" src="data:audio/wav;base64,{alarm_base64}"></audio>
+<script>
+function playAlarm() {{
+  var a = document.getElementById("alarm");
+  if (a) {{
+    a.currentTime = 0;
+    a.play().catch(e=>console.log("play failed", e));
+  }}
+}}
+</script>
+"""
+st.components.v1.html(audio_html, height=0)
 
-frames_buffer = []
+# ---------------------------------------------------------
+# WebRTC Video Transformer (تحليل مباشر)
+# ---------------------------------------------------------
+class VideoProcessor(VideoTransformerBase):
+    def __init__(self):
+        self.frames_buffer = []
+        self.seq_len = 8
 
-col1, col2 = st.columns([2,1])
-with col1:
-    cam_file = st.camera_input("Open camera (mobile / desktop)", key="cam")
-    if cam_file is not None:
-        # convert to numpy array
-        img = Image.open(cam_file).convert("RGB")
-        img_np = np.array(img)[:,:,::-1]  # BGR for OpenCV-style
-        # stream processing: append transformed frame
-        tensor_frame = transform(img_np)
-        frames_buffer.append(tensor_frame)
-        if len(frames_buffer) > seq_len:
-            frames_buffer.pop(0)
+    def transform(self, frame: av.VideoFrame):
+        img = frame.to_ndarray(format="bgr24")
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        tensor_frame = transform(img_rgb)
+        self.frames_buffer.append(tensor_frame)
+        if len(self.frames_buffer) > self.seq_len:
+            self.frames_buffer.pop(0)
 
-        # show preview
-        st.image(img, caption="Captured frame", use_column_width=True)
+        label = "Waiting..."
+        color = (0, 255, 0)
 
-with col2:
-    st.markdown("### Status")
-    st.write(f"Buffered frames: {len(frames_buffer)}/{seq_len}")
+        if len(self.frames_buffer) == self.seq_len:
+            clip = torch.stack(self.frames_buffer).unsqueeze(0).to(device)
+            with torch.no_grad():
+                out = model(clip)
+                pred = torch.argmax(out, dim=1).item()
 
-    # Play alarm HTML element
-    if os.path.exists(ALERT_AUDIO):
-        audio_bytes = open(ALERT_AUDIO, "rb").read()
-        b64 = base64.b64encode(audio_bytes).decode()
-        audio_html = f"""
-        <audio id="alarm" src="data:audio/wav;base64,{b64}"></audio>
-        <script>
-        function playAlarm() {{
-            var a = document.getElementById('alarm');
-            try {{
-                a.currentTime = 0;
-                a.play();
-            }} catch(e) {{
-                console.log("play failed", e);
-            }}
-        }}
-        </script>
-        """
-        st.components.v1.html(audio_html, height=0)
+            if pred == 1:
+                label = "⚠️ Violent"
+                color = (0, 0, 255)
+                # تشغيل الإنذار على الواجهة
+                st.components.v1.html("<script>playAlarm();</script>", height=0)
+            else:
+                label = "✅ Non-violent"
+                color = (0, 255, 0)
 
-# Run inference when buffer full
-if len(frames_buffer) == seq_len:
-    clip = torch.stack(frames_buffer).unsqueeze(0).to(device)  # [1,T,C,H,W]
-    with torch.no_grad():
-        out = model(clip)
-        pred = torch.argmax(out, dim=1).item()
-    label = "Violent" if pred == 1 else "Non-Violent"
-    st.markdown(f"## Result: **{label}**")
-    if pred == 1:
-        st.markdown("<b style='color:red'>⚠️ Violent behavior detected!</b>", unsafe_allow_html=True)
-        # attempt to play alarm via JS
-        st.components.v1.html("<script>try{document.getElementById('alarm').play();}catch(e){console.log(e);}</script>", height=0)
-    else:
-        st.success("Normal activity - monitoring...")
-else:
-    st.write("Waiting for enough frames to run prediction... (التقط/حدّث الكاميرا حتى تتجمع عدد الفريمات المطلوب)")
+            # عرض النتيجة على الفيديو
+            cv2.putText(img, label, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+# ---------------------------------------------------------
+# واجهة Streamlit
+# ---------------------------------------------------------
+st.title("🚨 Real-time Violence Detection")
+st.markdown("افتح الكاميرا مباشرة وسيظهر التصنيف في الوقت الفعلي (Violent / Non-violent).")
+
+ctx = webrtc_streamer(
+    key="example",
+    mode=WebRtcMode.SENDRECV,
+    video_processor_factory=VideoProcessor,
+    media_stream_constraints={"video": True, "audio": False},
+)
+
+st.success("✅ Ready — افتح الكاميرا بالسماح في المتصفح")
